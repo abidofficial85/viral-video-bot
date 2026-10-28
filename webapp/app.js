@@ -1,8 +1,8 @@
 /* Viral Video Mini App — vanilla JS, no build step.
  *
  * Flow: pick a video -> show Monetag Rewarded Interstitial
- * (show_<ZONE_ID>() from the Monetag SDK tag) -> the SDK resolves
- * with reward_event_type; only 'valued' unlocks the video ->
+ * (show_<ZONE_ID>() from the Monetag SDK tag) -> the promise resolving
+ * means the ad was fully watched, so it unlocks the video ->
  * POST /api/unlock (Telegram initData proves the real user) ->
  * 1-hour token -> <video src="/api/stream?token=...">.
  *
@@ -75,16 +75,25 @@
     });
   }
 
-  function showRealAd(ymid) {
+  function showRealAd() {
     var fnName = 'show_' + config.zoneId;
     var fn = window[fnName];
     if (typeof fn !== 'function') {
       return Promise.reject(new Error(
         'Monetag SDK লোড হয়নি। Zone ID / SDK URL ঠিক আছে কিনা দেখুন।'));
     }
-    // Per Monetag docs: the promise resolves after the ad closes;
-    // reward_event_type 'valued' is the only result that earns the reward.
-    return fn({ ymid: ymid, requestVar: 'video_' + (selected && selected.id) });
+    // Exactly Monetag's Rewarded Interstitial snippet: show_<zone>()
+    // with no arguments; the promise resolving IS the reward (ad fully
+    // watched). Some SDK builds resolve with {reward_event_type}; an
+    // explicit non-valued result still counts as not rewarded, and a
+    // rejection (ad closed early / failed) propagates as an error.
+    return fn().then(function (res) {
+      if (res && res.reward_event_type &&
+          res.reward_event_type !== 'valued') {
+        throw new Error('এডটি পুরো দেখা হয়নি (valued হয়নি)। আবার চেষ্টা করুন।');
+      }
+      return { reward_event_type: 'valued' };
+    });
   }
 
   function requestId() {
@@ -96,7 +105,7 @@
 
   function unlockVideo() {
     var ymid = requestId();
-    var adPromise = config.testMode ? fakeAd() : showRealAd(ymid);
+    var adPromise = config.testMode ? fakeAd() : showRealAd();
     $('adBtn').disabled = true;
     setGateStatus('এড লোড হচ্ছে...');
     return adPromise.then(function (res) {
