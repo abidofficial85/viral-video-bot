@@ -28,16 +28,26 @@ What it does
 Environment variables (see .env.example):
     BOT_TOKEN        Telegram bot token (from @BotFather, fresh token!)
     ADMIN_ID         Your Telegram user id (from @userinfobot)
-    WEBAPP_URL       Public https URL of this service (Render URL)
+    WEBAPP_URL       Public https URL of this service (Render /
+                     PythonAnywhere URL)
     MONETAG_ZONE_ID  Main zone id from the Monetag dashboard (optional:
                      without it the app runs in TEST MODE with a fake ad)
     MONETAG_SDK_URL  SDK script URL from the Monetag dashboard (optional)
+    BOT_MODE         "polling" (default, Render-style) or "webhook"
+                     (PythonAnywhere-style: Telegram calls us, so the app
+                     may sleep between messages)
+    WEBHOOK_SECRET   Optional webhook path secret. If empty it is derived
+                     from BOT_TOKEN, so no extra setup is needed.
+    TG_PROXY         Optional outbound proxy for free-tier hosts that
+                     restrict egress (PythonAnywhere free:
+                     http://proxy.server:3128). Empty = direct.
     PORT             Port to listen on (Render sets this automatically)
     DATA_DIR         Where videos.json / postbacks.log live (default ".")
     TELEGRAM_API_BASE  For testing only (default https://api.telegram.org)
 
-NEVER put BOT_TOKEN in chat, in git, or in this file. Render's
-Environment Variables page is the only place it should live.
+NEVER put BOT_TOKEN in chat, in git, or in this file. The host's
+environment (Render Environment Variables page, or PythonAnywhere's
+private WSGI file) is the only place it should live.
 """
 
 import hashlib
@@ -68,6 +78,36 @@ PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 FILE_BASE = API_BASE + "/file"
+
+# Bot update mode: "polling" (default, Render-style long polling) or
+# "webhook" (PythonAnywhere-style: Telegram calls us, so the app can
+# sleep between messages and wake on demand).
+BOT_MODE = os.environ.get("BOT_MODE", "polling").strip().lower()
+if BOT_MODE not in ("polling", "webhook"):
+    BOT_MODE = "polling"
+
+# Webhook path secret. If not set explicitly, it is derived from the bot
+# token (unreadable without the token), so no extra user step is needed.
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+if not WEBHOOK_SECRET and BOT_TOKEN:
+    WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:24]
+
+# Outbound HTTP proxy for hosts whose free tier restricts direct egress
+# (PythonAnywhere free: http://proxy.server:3128). Empty = direct.
+TG_PROXY = os.environ.get("TG_PROXY", "").strip()
+_TG_OPENER = None
+
+
+def tg_urlopen(url_or_req, timeout):
+    """urlopen that honours TG_PROXY for Telegram API/file hosts."""
+    global _TG_OPENER
+    if TG_PROXY:
+        if _TG_OPENER is None:
+            _TG_OPENER = urllib.request.build_opener(
+                urllib.request.ProxyHandler(
+                    {"http": TG_PROXY, "https": TG_PROXY}))
+        return _TG_OPENER.open(url_or_req, timeout=timeout)
+    return urllib.request.urlopen(url_or_req, timeout=timeout)
 
 TEST_MODE = not MONETAG_ZONE_ID  # no Monetag configured -> fake ad, full test flow
 VIDEOS_PATH = os.path.join(DATA_DIR, "videos.json")
@@ -139,7 +179,7 @@ def tg_api(method, payload=None, timeout=40):
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with tg_urlopen(req, timeout=timeout) as resp:
             body = json.load(resp)
     except urllib.error.HTTPError as e:
         try:
@@ -189,7 +229,7 @@ def tg_send_document(chat_id, filename, content_bytes, caption=""):
     req = urllib.request.Request(
         url, data=b"".join(body),
         headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with tg_urlopen(req, timeout=60) as resp:
         result = json.load(resp)
     if not result.get("ok"):
         raise RuntimeError("sendDocument failed: %s" % result.get("description"))
@@ -286,7 +326,7 @@ def handle_restore_document(message):
         info = tg_api("getFile", {"file_id": doc["file_id"]})
         path = info.get("file_path", "")
         url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN, path)
-        with urllib.request.urlopen(url, timeout=60) as resp:
+        with tg_urlopen(url, timeout=60) as resp:
             data = json.load(resp)
         videos = data.get("videos")
         if not isinstance(videos, list):
@@ -317,7 +357,7 @@ def handle_watch_callback(callback_id, chat_id, video_id):
     else:
         tg_send_message(chat_id,
                         "⚠️ Mini App-এর লিংক (WEBAPP_URL) এখনো বসানো হয়নি। "
-                        "Render-এ WEBAPP_URL সেট করে আবার Deploy দিন।")
+                        "হোস্টে WEBAPP_URL সেট করে আবার চালু করুন।")
 
 
 def handle_delete_callback(callback_id, chat_id, video_id):
@@ -386,6 +426,12 @@ def bot_polling_loop():
         return
     if not ADMIN_ID_INT:
         log("WARNING: ADMIN_ID not set — admin commands will not work.")
+    # If a webhook was registered earlier (e.g. webhook-mode host), remove
+    # it so long polling can receive updates again.
+    try:
+        tg_api("deleteWebhook", {"drop_pending_updates": True}, timeout=20)
+    except Exception as e:  # noqa: BLE001 - polling still works without this
+        log("deleteWebhook (best effort) failed: %s" % e)
     offset = 0
     log("Bot polling started.")
     while True:
@@ -402,6 +448,34 @@ def bot_polling_loop():
         except Exception as e:  # noqa: BLE001 - polling must survive network errors
             log("polling error (retrying in 5s): %s" % e)
             time.sleep(5)
+
+
+# ---------------------------------------------------------------- webhook mode
+
+def webhook_path():
+    return "/webhook/" + WEBHOOK_SECRET if WEBHOOK_SECRET else "/webhook"
+
+
+def setup_webhook():
+    """Point Telegram at this service's webhook URL. Idempotent."""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    if not WEBAPP_URL:
+        raise RuntimeError("WEBAPP_URL is not set")
+    url = WEBAPP_URL + webhook_path()
+    return tg_api("setWebhook", {
+        "url": url,
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": True}, timeout=20)
+
+
+def maybe_setup_webhook():
+    """Best-effort setWebhook at startup; never raises."""
+    try:
+        setup_webhook()
+        log("Webhook registered: %s" % (WEBAPP_URL + webhook_path()))
+    except Exception as e:  # noqa: BLE001 - retry via /api/setup-webhook
+        log("setWebhook failed (retry via POST /api/setup-webhook): %s" % e)
 
 
 # ---------------------------------------------------------------- initData check
@@ -437,7 +511,211 @@ def verify_init_data(init_data):
         return None
 
 
-# ---------------------------------------------------------------- HTTP server
+# ---------------------------------------------------------------- HTTP layer
+#
+# One dispatch() serves both transports:
+#   * ThreadingHTTPServer (Render / local runs) via Handler below
+#   * any WSGI host (PythonAnywhere) via application() below
+# dispatch() returns (status, [(header, value), ...], body_iterable).
+
+_REASONS = {
+    200: "OK",
+    400: "Bad Request",
+    403: "Forbidden",
+    404: "Not Found",
+    502: "Bad Gateway",
+}
+
+
+def json_response(status, obj):
+    body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    return status, [("Content-Type", "application/json; charset=utf-8"),
+                    ("Content-Length", str(len(body)))], [body]
+
+
+def json_error(status, message):
+    return json_response(status, {"error": message})
+
+
+def serve_static_file(name):
+    if not name or ".." in name or name.startswith("/"):
+        return json_error(404, "not found")
+    full = os.path.normpath(os.path.join(WEBAPP_DIR, name))
+    if not full.startswith(os.path.normpath(WEBAPP_DIR)):
+        return json_error(404, "not found")
+    if not os.path.isfile(full):
+        return json_error(404, "not found")
+    mime, _ = mimetypes.guess_type(full)
+    with open(full, "rb") as f:
+        body = f.read()
+    return 200, [("Content-Type", mime or "application/octet-stream"),
+                 ("Content-Length", str(len(body)))], [body]
+
+
+def do_unlock(body_bytes):
+    try:
+        body = json.loads(body_bytes.decode("utf-8"))
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    video_id = body.get("videoId", "")
+    reward = body.get("rewardEventType", "")
+    ymid = body.get("ymid", "")
+    user = verify_init_data(body.get("initData", ""))
+    if not user:
+        return json_error(403, "Telegram পরিচয় যাচাই হয়নি। "
+                               "Mini App-টি Telegram-এর ভেতর "
+                               "থেকে খুলুন।")
+    if not TEST_MODE and reward != "valued":
+        # Monetag: only a 'valued' ad result earns the reward.
+        return json_error(403, "এডটি পুরো দেখা হয়নি (valued হয়নি)। "
+                               "আবার এড দেখুন।")
+    video = find_video(video_id)
+    if not video:
+        return json_error(404, "ভিডিওটি পাওয়া যায়নি।")
+    token = secrets.token_urlsafe(24)
+    TOKENS[token] = {
+        "user_id": user.get("id"),
+        "video_id": video_id,
+        "expires": time.time() + 600,  # 10 minutes, single use
+        "used": False,
+    }
+    log("unlock: user=%s video=%s ymid=%s test=%s" %
+        (user.get("id"), video_id, ymid, TEST_MODE))
+    return json_response(200, {"token": token})
+
+
+def do_postback(body_bytes):
+    try:
+        with open(POSTBACKS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": int(time.time()),
+                "raw": body_bytes.decode("utf-8", "replace"),
+            }, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log("postback log failed: %s" % e)
+    return json_response(200, {"ok": True})
+
+
+def open_stream(token, range_header):
+    """Eagerly open the upstream file; return (status, headers, chunks)."""
+    entry = TOKENS.get(token)
+    if not entry or entry.get("used") or time.time() > entry["expires"]:
+        return json_error(403, "লিংকটির মেয়াদ শেষ বা ব্যবহার হয়ে "
+                               "গেছে। আবার এড দেখুন।")
+    entry["used"] = True
+    video = find_video(entry["video_id"])
+    if not video:
+        return json_error(404, "ভিডিওটি পাওয়া যায়নি।")
+    try:
+        info = tg_api("getFile", {"file_id": video["file_id"]}, timeout=30)
+        file_url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN,
+                                    info.get("file_path", ""))
+    except Exception as e:  # noqa: BLE001 - report cleanly
+        return json_error(502, "ভিডিও আনতে সমস্যা: %s" % e)
+    # Count the view on first successful stream start.
+    try:
+        with STORE_LOCK:
+            videos = load_videos()
+            for v in videos:
+                if v.get("id") == video["id"]:
+                    v["views"] = int(v.get("views", 0)) + 1
+            save_videos(videos)
+    except OSError:
+        pass
+    headers = {}
+    if range_header:
+        headers["Range"] = range_header
+    req = urllib.request.Request(file_url, headers=headers)
+    try:
+        upstream = tg_urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        return e.code, [("Content-Length", "0")], [b""]
+    except Exception as e:  # noqa: BLE001
+        return json_error(502, "ভিডিও স্ট্রিমে সমস্যা: %s" % e)
+    out_headers = []
+    out_headers.append(("Content-Type",
+                        upstream.headers.get("Content-Type") or "video/mp4"))
+    if upstream.headers.get("Content-Range"):
+        out_headers.append(("Content-Range",
+                            upstream.headers["Content-Range"]))
+    if upstream.headers.get("Content-Length"):
+        out_headers.append(("Content-Length",
+                            upstream.headers["Content-Length"]))
+    out_headers.append(("Accept-Ranges", "bytes"))
+
+    def chunks():
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return upstream.status, out_headers, chunks()
+
+
+def do_webhook(body_bytes):
+    try:
+        update = json.loads(body_bytes.decode("utf-8"))
+    except ValueError:
+        return json_error(400, "bad update")
+    if not isinstance(update, dict):
+        return json_error(400, "bad update")
+    try:
+        handle_update(update)
+    except Exception as e:  # noqa: BLE001 - still ack so Telegram stops retrying
+        log("webhook handler error: %s" % e)
+    return json_response(200, {"ok": True})
+
+
+def do_setup_webhook():
+    try:
+        setup_webhook()
+    except Exception as e:  # noqa: BLE001 - report cleanly
+        return json_error(502, "setWebhook ব্যর্থ: %s" % e)
+    return json_response(200, {
+        "ok": True,
+        "webhook_url": WEBAPP_URL + webhook_path(),
+    })
+
+
+def dispatch(method, path, query, headers, body_bytes):
+    """Route one request. query: parse_qs dict. headers: lower-cased dict."""
+    if method == "GET":
+        if path == "/api/config":
+            return json_response(200, {
+                "appName": "Viral Video",
+                "testMode": TEST_MODE,
+                "zoneId": MONETAG_ZONE_ID or None,
+                "sdkUrl": MONETAG_SDK_URL or None,
+            })
+        if path == "/api/videos":
+            return json_response(200, {"videos": [public_video(v)
+                                                  for v in load_videos()]})
+        if path == "/api/stream":
+            return open_stream(query.get("token", [""])[0],
+                               headers.get("range"))
+        if path in ("/", "/index.html"):
+            return serve_static_file("index.html")
+        if path.startswith("/"):
+            return serve_static_file(path.lstrip("/"))
+        return json_error(404, "not found")
+    if method == "POST":
+        if path == "/api/unlock":
+            return do_unlock(body_bytes)
+        if path == "/api/monetag-postback":
+            return do_postback(body_bytes)
+        if path == "/api/setup-webhook":
+            return do_setup_webhook()
+        if path == webhook_path():
+            return do_webhook(body_bytes)
+        return json_error(404, "not found")
+    return json_error(404, "not found")
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -445,192 +723,62 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # keep stdout clean
         pass
 
-    # -- helpers ------------------------------------------------------
-    def send_json(self, status, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def _respond(self, method, path, query, body_bytes):
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        status, out_headers, body_iter = dispatch(
+            method, path, query, headers, body_bytes)
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        names = [k.lower() for k, _ in out_headers]
+        for k, v in out_headers:
+            self.send_header(k, v)
+        if "content-length" not in names:
+            # No length (e.g. length-less stream): close after this body.
+            self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
-
-    def read_json_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > 65536:
-            return {}
-        raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
-        except ValueError:
-            return {}
+            for chunk in body_iter:
+                if chunk:
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-    # -- routes -------------------------------------------------------
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
-        if path == "/api/config":
-            self.send_json(200, {
-                "appName": "Viral Video",
-                "testMode": TEST_MODE,
-                "zoneId": MONETAG_ZONE_ID or None,
-                "sdkUrl": MONETAG_SDK_URL or None,
-            })
-        elif path == "/api/videos":
-            self.send_json(200, {"videos": [public_video(v)
-                                            for v in load_videos()]})
-        elif path == "/api/stream":
-            self.handle_stream(query.get("token", [""])[0])
-        elif path in ("/", "/index.html"):
-            self.serve_static("index.html")
-        elif path.startswith("/"):
-            self.serve_static(path.lstrip("/"))
-        else:
-            self.send_json(404, {"error": "not found"})
+        self._respond("GET", parsed.path,
+                      urllib.parse.parse_qs(parsed.query), b"")
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/unlock":
-            self.handle_unlock()
-        elif parsed.path == "/api/monetag-postback":
-            self.handle_postback()
-        else:
-            self.send_json(404, {"error": "not found"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        body = self.rfile.read(min(length, 1048576)) if length > 0 else b""
+        self._respond("POST", parsed.path,
+                      urllib.parse.parse_qs(parsed.query), body)
 
-    # -- static -------------------------------------------------------
-    def serve_static(self, name):
-        if not name or ".." in name or name.startswith("/"):
-            self.send_json(404, {"error": "not found"})
-            return
-        full = os.path.normpath(os.path.join(WEBAPP_DIR, name))
-        if not full.startswith(os.path.normpath(WEBAPP_DIR)):
-            self.send_json(404, {"error": "not found"})
-            return
-        if not os.path.isfile(full):
-            self.send_json(404, {"error": "not found"})
-            return
-        mime, _ = mimetypes.guess_type(full)
-        with open(full, "rb") as f:
-            body = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", mime or "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
-    # -- unlock -------------------------------------------------------
-    def handle_unlock(self):
-        body = self.read_json_body()
-        video_id = body.get("videoId", "")
-        reward = body.get("rewardEventType", "")
-        ymid = body.get("ymid", "")
-        user = verify_init_data(body.get("initData", ""))
-        if not user:
-            self.send_json(403, {"error": "Telegram পরিচয় যাচাই হয়নি। "
-                                            "Mini App-টি Telegram-এর ভেতর "
-                                            "থেকে খুলুন।"})
-            return
-        if not TEST_MODE and reward != "valued":
-            # Monetag: only a 'valued' ad result earns the reward.
-            self.send_json(403, {"error": "এডটি পুরো দেখা হয়নি (valued হয়নি)। "
-                                            "আবার এড দেখুন।"})
-            return
-        video = find_video(video_id)
-        if not video:
-            self.send_json(404, {"error": "ভিডিওটি পাওয়া যায়নি।"})
-            return
-        token = secrets.token_urlsafe(24)
-        TOKENS[token] = {
-            "user_id": user.get("id"),
-            "video_id": video_id,
-            "expires": time.time() + 600,  # 10 minutes, single use
-            "used": False,
-        }
-        log("unlock: user=%s video=%s ymid=%s test=%s" %
-            (user.get("id"), video_id, ymid, TEST_MODE))
-        self.send_json(200, {"token": token})
-
-    # -- postback audit log -------------------------------------------
-    def handle_postback(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            with open(POSTBACKS_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "ts": int(time.time()),
-                    "raw": raw.decode("utf-8", "replace"),
-                }, ensure_ascii=False) + "\n")
-        except OSError as e:
-            log("postback log failed: %s" % e)
-        self.send_json(200, {"ok": True})
-
-    # -- stream proxy ---------------------------------------------------
-    def handle_stream(self, token):
-        entry = TOKENS.get(token)
-        if not entry or entry.get("used") or time.time() > entry["expires"]:
-            self.send_json(403, {"error": "লিংকটির মেয়াদ শেষ বা ব্যবহার হয়ে "
-                                            "গেছে। আবার এড দেখুন।"})
-            return
-        entry["used"] = True
-        video = find_video(entry["video_id"])
-        if not video:
-            self.send_json(404, {"error": "ভিডিওটি পাওয়া যায়নি।"})
-            return
-        try:
-            info = tg_api("getFile", {"file_id": video["file_id"]}, timeout=30)
-            file_url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN,
-                                        info.get("file_path", ""))
-        except Exception as e:  # noqa: BLE001 - report cleanly
-            self.send_json(502, {"error": "ভিডিও আনতে সমস্যা: %s" % e})
-            return
-        # Count the view on first successful stream start.
-        try:
-            with STORE_LOCK:
-                videos = load_videos()
-                for v in videos:
-                    if v.get("id") == video["id"]:
-                        v["views"] = int(v.get("views", 0)) + 1
-                save_videos(videos)
-        except OSError:
-            pass
-        # Proxy with Range support (seeking). Stream in chunks, never
-        # load the whole file into memory.
-        headers = {}
-        if self.headers.get("Range"):
-            headers["Range"] = self.headers["Range"]
-        req = urllib.request.Request(file_url, headers=headers)
-        try:
-            upstream = urllib.request.urlopen(req, timeout=120)
-        except urllib.error.HTTPError as e:
-            self.send_response(e.code)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        except Exception as e:  # noqa: BLE001
-            self.send_json(502, {"error": "ভিডিও স্ট্রিমে সমস্যা: %s" % e})
-            return
-        status = upstream.status
-        self.send_response(status)
-        ctype = upstream.headers.get("Content-Type") or "video/mp4"
-        self.send_header("Content-Type", ctype)
-        if upstream.headers.get("Content-Range"):
-            self.send_header("Content-Range",
-                             upstream.headers["Content-Range"])
-        if upstream.headers.get("Content-Length"):
-            self.send_header("Content-Length",
-                             upstream.headers["Content-Length"])
-        self.send_header("Accept-Ranges", "bytes")
-        self.end_headers()
-        try:
-            while True:
-                chunk = upstream.read(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            upstream.close()
+def application(environ, start_response):
+    """WSGI entry point (PythonAnywhere and any WSGI host)."""
+    method = environ.get("REQUEST_METHOD", "GET")
+    path = environ.get("PATH_INFO", "/") or "/"
+    query = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+    headers = {}
+    for key, value in environ.items():
+        if key.startswith("HTTP_"):
+            headers[key[5:].replace("_", "-").lower()] = value
+    if environ.get("CONTENT_TYPE"):
+        headers["content-type"] = environ["CONTENT_TYPE"]
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        length = 0
+    body = environ["wsgi.input"].read(length) if length > 0 else b""
+    status, out_headers, body_iter = dispatch(
+        method, path, query, headers, body)
+    start_response("%d %s" % (status, _REASONS.get(status, "OK")),
+                   out_headers)
+    return body_iter
 
 
 def main():
@@ -639,7 +787,15 @@ def main():
     if TEST_MODE:
         log("TEST MODE: no MONETAG_ZONE_ID — Mini App will use a fake ad "
             "so the full flow can be tested before Monetag is configured.")
-    threading.Thread(target=bot_polling_loop, daemon=True).start()
+    if BOT_MODE == "webhook":
+        log("Webhook mode: polling disabled; Telegram will call us.")
+        if WEBAPP_URL:
+            maybe_setup_webhook()
+        else:
+            log("WEBAPP_URL not set — set it, then POST /api/setup-webhook "
+                "to register the webhook.")
+    else:
+        threading.Thread(target=bot_polling_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log("Serving on port %d (webapp dir: %s)" % (PORT, WEBAPP_DIR))
     server.serve_forever()
