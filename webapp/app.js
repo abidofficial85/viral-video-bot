@@ -45,10 +45,15 @@
   function setGateStatus(text) { $('gateStatus').textContent = text || ''; }
 
   function loadMonetagSdk() {
-    if (!config.sdkUrl || monetagLoaded) return;
+    if (!config.sdkUrl || !config.zoneId || monetagLoaded) return;
     var script = document.createElement('script');
     script.src = config.sdkUrl;
     script.async = true;
+    // Mirror the Monetag tag exactly: the SDK binds show_<zone> to the
+    // zone named in these attributes — without them the function that
+    // showRealAd calls would never be defined.
+    script.dataset.zone = config.zoneId;
+    script.dataset.sdk = 'show_' + config.zoneId;
     script.onload = function () { monetagLoaded = true; };
     document.head.appendChild(script);
   }
