@@ -17,7 +17,8 @@ What it does
     User picks a video -> watches a Monetag Rewarded Interstitial ad
     (show_<ZONE_ID>() from the Monetag SDK tag) -> server verifies the
     Telegram identity (initData signature) and that the ad result was
-    'valued' -> issues a one-time, 10-minute stream token -> the video
+    'valued' -> issues a 1-hour stream token (reusable for the player's
+    range requests) -> the video
     plays from /api/stream, proxied from Telegram's file servers with
     Range support (seeking works).
 * Monetag postbacks: POST /api/monetag-postback is logged to
@@ -142,7 +143,7 @@ POSTBACKS_PATH = os.path.join(DATA_DIR, "postbacks.log")
 WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
 
 STORE_LOCK = threading.Lock()
-TOKENS = {}  # token -> {user_id, video_id, expires, used}
+TOKENS = {}  # token -> {user_id, video_id, expires, counted}
 
 
 def log(msg):
@@ -605,8 +606,8 @@ def do_unlock(body_bytes):
     TOKENS[token] = {
         "user_id": user.get("id"),
         "video_id": video_id,
-        "expires": time.time() + 600,  # 10 minutes, single use
-        "used": False,
+        "expires": time.time() + 3600,  # 1 hour, reusable for range reqs
+        "counted": False,  # view counted once, on first successful stream
     }
     log("unlock: user=%s video=%s ymid=%s test=%s" %
         (user.get("id"), video_id, ymid, TEST_MODE))
@@ -628,16 +629,17 @@ def do_postback(body_bytes):
 def open_stream(token, range_header):
     """Eagerly open the upstream file; return (status, headers, chunks).
 
-    The one-time token is consumed ONLY once the upstream opens
-    successfully: if getFile or the upstream fails (e.g. the flaky free
-    proxy), the same token still works for a retry instead of dying
-    with 403 on the second attempt (seen 2026-10-28: first stream
-    request 502, retry 4s later 403).
+    The token is valid for one hour from unlock and may be reused for
+    every range request the <video> player makes: a browser player
+    fetches a video in several Range requests (metadata probe, then
+    the data it plays), so a single-use token always broke playback
+    with 403 on the second request (seen 2026-10-28: unlock 200, first
+    stream 206, second stream 403, video never started). The view is
+    still counted only once per token.
     """
     entry = TOKENS.get(token)
-    if not entry or entry.get("used") or time.time() > entry["expires"]:
-        return json_error(403, "লিংকটির মেয়াদ শেষ বা ব্যবহার হয়ে "
-                               "গেছে। আবার এড দেখুন।")
+    if not entry or time.time() > entry["expires"]:
+        return json_error(403, "লিংকটির মেয়াদ শেষ। আবার এড দেখুন।")
     video = find_video(entry["video_id"])
     if not video:
         return json_error(404, "ভিডিওটি পাওয়া যায়নি।")
@@ -671,17 +673,18 @@ def open_stream(token, range_header):
             break
     if upstream is None:
         return json_error(502, "ভিডিও স্ট্রিমে সমস্যা: %s" % last_error)
-    # Upstream is open: consume the token and count the view now.
-    entry["used"] = True
-    try:
-        with STORE_LOCK:
-            videos = load_videos()
-            for v in videos:
-                if v.get("id") == video["id"]:
-                    v["views"] = int(v.get("views", 0)) + 1
-            save_videos(videos)
-    except OSError:
-        pass
+    # Upstream is open: count the view once per token.
+    if not entry.get("counted"):
+        entry["counted"] = True
+        try:
+            with STORE_LOCK:
+                videos = load_videos()
+                for v in videos:
+                    if v.get("id") == video["id"]:
+                        v["views"] = int(v.get("views", 0)) + 1
+                save_videos(videos)
+        except OSError:
+            pass
     out_headers = []
     out_headers.append(("Content-Type",
                         upstream.headers.get("Content-Type") or "video/mp4"))
