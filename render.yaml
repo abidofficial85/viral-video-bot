@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: viral-video-bot
+    env: python
+    startCommand: python3 main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
+      - key: MONETAG_ZONE_ID
+        sync: false
+      - key: MONETAG_SDK_URL
+        sync: false

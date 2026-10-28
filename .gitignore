@@ -1,0 +1,6 @@
+# Generated runtime files — never commit these.
+videos.json
+videos.json.tmp
+postbacks.log
+.env
+__pycache__/
