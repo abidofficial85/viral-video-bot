@@ -1,0 +1,43 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: #0a0a0c; color: #f2ead8;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header { padding: 16px; border-bottom: 1px solid #2a2415; }
+h1 { margin: 0 0 4px; font-size: 22px; color: #e8c26a; }
+h2 { font-size: 18px; color: #e8c26a; }
+#subtitle { margin: 0; color: #b9b09a; font-size: 14px; }
+.badge {
+  display: inline-block; margin-top: 10px; padding: 4px 10px;
+  border: 1px solid #e8c26a; border-radius: 20px;
+  color: #e8c26a; font-size: 12px;
+}
+.hidden { display: none !important; }
+.muted { color: #b9b09a; font-size: 14px; }
+main { padding: 16px; }
+.grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.card {
+  background: #141418; border: 1px solid #2a2415;
+  border-radius: 12px; padding: 14px;
+}
+.card-title { font-weight: 600; margin-bottom: 6px; }
+.card-meta { color: #b9b09a; font-size: 13px; margin-bottom: 10px; }
+.btn {
+  border: none; border-radius: 10px; padding: 12px 16px;
+  font-size: 15px; cursor: pointer; width: 100%;
+}
+.btn.gold { background: #e8c26a; color: #141414; font-weight: 700; }
+.btn.secondary { background: #24242a; color: #f2ead8; margin-top: 10px; }
+.btn.small { width: auto; padding: 9px 14px; font-size: 14px; }
+.btn:disabled { opacity: 0.5; }
+video { width: 100%; border-radius: 12px; background: #000; }
+#gate {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.8);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.gate-box {
+  background: #141418; border: 1px solid #e8c26a;
+  border-radius: 16px; padding: 20px; width: 100%; max-width: 360px;
+  text-align: center;
+}
+.gate-box p { color: #b9b09a; }

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Viral Video</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>🎬 Viral Video</h1>
+  <p id="subtitle">ভিডিও বাছুন, এড দেখুন, তারপর দেখুন</p>
+  <div id="testBadge" class="badge hidden">টেস্ট মোড — আসল এড এখনো বসানো হয়নি</div>
+</header>
+
+<main>
+  <section id="listSection">
+    <div id="videoList" class="grid"></div>
+    <p id="emptyMsg" class="muted hidden">এখনো কোনো ভিডিও যোগ হয়নি।</p>
+  </section>
+
+  <section id="playerSection" class="hidden">
+    <h2 id="playerTitle"></h2>
+    <video id="player" controls playsinline preload="metadata"></video>
+    <p id="status" class="muted"></p>
+    <button id="backBtn" class="btn secondary">← সব ভিডিও</button>
+  </section>
+</main>
+
+<div id="gate" class="hidden">
+  <div class="gate-box">
+    <h2 id="gateTitle"></h2>
+    <p id="gateText">এড দেখলেই ভিডিওটি আনলক হবে।</p>
+    <button id="adBtn" class="btn gold">▶️ এড দেখে ভিডিও দেখুন</button>
+    <button id="gateClose" class="btn secondary">বন্ধ করুন</button>
+    <p id="gateStatus" class="muted"></p>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
