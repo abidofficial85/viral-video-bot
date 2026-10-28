@@ -31,5 +31,10 @@ os.environ["BOT_MODE"] = "webhook"
 os.environ["TG_PROXY"] = "http://proxy.server:3128"
 os.environ["WEBAPP_URL"] = "https://USERNAME.pythonanywhere.com"
 os.environ["DATA_DIR"] = "/home/USERNAME/viral-video-bot"
+# Optional: Monetag real ads — uncomment and fill in your own values
+# (Zone ID + SDK URL from your Monetag dashboard, Rewarded Interstitial
+# zone). Without these the Mini App stays in test mode (fake ad).
+# os.environ["MONETAG_ZONE_ID"] = "PASTE_MONETAG_ZONE_ID_HERE"
+# os.environ["MONETAG_SDK_URL"] = "PASTE_MONETAG_SDK_URL_HERE"
 
 from main import application  # noqa: E402,F401  (WSGI callable)
