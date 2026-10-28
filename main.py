@@ -183,6 +183,7 @@ def public_video(v):
         "title": v.get("title"),
         "duration": v.get("duration", 0),
         "views": v.get("views", 0),
+        "thumb": bool(v.get("thumb_file_id")),
     }
 
 
@@ -329,11 +330,15 @@ def handle_video_upload(message):
     if not file_id:
         return
     title = (message.get("caption") or "").strip() or "Untitled"
+    # Telegram attaches a thumbnail PhotoSize to videos ("thumbnail",
+    # older clients "thumb") — keep it as the grid poster.
+    thumb = video.get("thumbnail") or video.get("thumb") or {}
     with STORE_LOCK:
         videos = load_videos()
         videos.append({
             "id": secrets.token_hex(6),
             "file_id": file_id,
+            "thumb_file_id": thumb.get("file_id"),
             "title": title,
             "duration": int(video.get("duration") or 0),
             "views": 0,
@@ -734,6 +739,29 @@ def do_setup_webhook():
     })
 
 
+def open_thumb(video_id):
+    """Serve a video's Telegram thumbnail as the grid poster image."""
+    video = find_video(video_id)
+    if not video or not video.get("thumb_file_id"):
+        return json_error(404, "no thumbnail")
+    try:
+        info = tg_api("getFile", {"file_id": video["thumb_file_id"]},
+                      timeout=30)
+        file_url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN,
+                                    info.get("file_path", ""))
+    except Exception as e:  # noqa: BLE001 - report cleanly
+        return json_error(502, "thumbnail failed: %s" % e)
+    try:
+        with tg_urlopen_retry(file_url, timeout=30) as upstream:
+            data = upstream.read()
+            ctype = upstream.headers.get("Content-Type") or "image/jpeg"
+    except Exception as e:  # noqa: BLE001 - URLError etc.
+        return json_error(502, "thumbnail failed: %s" % e)
+    return 200, [("Content-Type", ctype),
+                 ("Content-Length", str(len(data))),
+                 ("Cache-Control", "public, max-age=86400")], [data]
+
+
 def dispatch(method, path, query, headers, body_bytes):
     """Route one request. query: parse_qs dict. headers: lower-cased dict."""
     if method == "GET":
@@ -750,6 +778,8 @@ def dispatch(method, path, query, headers, body_bytes):
         if path == "/api/stream":
             return open_stream(query.get("token", [""])[0],
                                headers.get("range"))
+        if path == "/api/thumb":
+            return open_thumb(query.get("video", [""])[0])
         if path in ("/", "/index.html"):
             return serve_static_file("index.html")
         if path.startswith("/"):
