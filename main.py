@@ -781,6 +781,15 @@ def application(environ, start_response):
     return body_iter
 
 
+# WSGI hosts (PythonAnywhere) import this module but never call main(),
+# so register the webhook at import time: otherwise Telegram never learns
+# where to deliver updates. (This exact bug bit us on 2026-10-28 — the app
+# served pages fine, but no update ever arrived, because nothing ever
+# called setWebhook.) Best-effort; never raises. In polling mode skipped.
+if BOT_MODE == "webhook":
+    maybe_setup_webhook()
+
+
 def main():
     if not BOT_TOKEN:
         log("WARNING: BOT_TOKEN not set — bot disabled until it is set.")
@@ -789,9 +798,7 @@ def main():
             "so the full flow can be tested before Monetag is configured.")
     if BOT_MODE == "webhook":
         log("Webhook mode: polling disabled; Telegram will call us.")
-        if WEBAPP_URL:
-            maybe_setup_webhook()
-        else:
+        if not WEBAPP_URL:
             log("WEBAPP_URL not set — set it, then POST /api/setup-webhook "
                 "to register the webhook.")
     else:

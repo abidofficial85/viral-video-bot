@@ -12,10 +12,10 @@
 #   3. Open the WSGI configuration file, replace its whole content with
 #      this file's content (with your own USERNAME, token and admin id),
 #      save, then press the green Reload button.
-#   4. Back in the bot code's directory the first web request triggers
-#      setWebhook automatically at import; if WEBAPP_URL was empty then,
-#      open https://USERNAME.pythonanywhere.com/api/setup-webhook in a
-#      browser (POST) after setting it — or just Reload again.
+#   4. Back in the bot code's directory the webhook registers automatically
+#      on import (every Reload re-registers it); if WEBAPP_URL was empty at
+#      import, POST to https://USERNAME.pythonanywhere.com/api/setup-webhook
+#      after setting it.
 #   5. In Telegram: /start the bot, and set the Menu Button to
 #      https://USERNAME.pythonanywhere.com (via @BotFather -> Bot Settings
 #      -> Menu Button).
