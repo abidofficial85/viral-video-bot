@@ -4,7 +4,11 @@
  * (show_<ZONE_ID>() from the Monetag SDK tag) -> the SDK resolves
  * with reward_event_type; only 'valued' unlocks the video ->
  * POST /api/unlock (Telegram initData proves the real user) ->
- * one-time token -> <video src="/api/stream?token=...">.
+ * 1-hour token -> <video src="/api/stream?token=...">.
+ *
+ * Home page: a 3-column poster grid (Reels-tab style) — poster image
+ * from /api/thumb when the video has a Telegram thumbnail, otherwise
+ * a dark fallback tile; view counts shown compactly (396K / 2.9M).
  *
  * TEST MODE (no Monetag zone configured on the server): the ad step
  * is a short fake countdown that always counts as 'valued', so the
@@ -27,6 +31,14 @@
     s = parseInt(s, 10) || 0;
     if (!s) return '';
     return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2);
+  }
+
+  function fmtViews(n) {
+    n = parseInt(n, 10) || 0;
+    var trim1 = function (x) { return x.toFixed(1).replace(/\.0$/, ''); };
+    if (n >= 1000000) return trim1(n / 1000000) + 'M';
+    if (n >= 1000) return trim1(n / 1000) + 'K';
+    return String(n);
   }
 
   function setStatus(text) { $('status').textContent = text || ''; }
@@ -141,19 +153,22 @@
     list.innerHTML = '';
     $('emptyMsg').classList.toggle('hidden', videos.length > 0);
     videos.forEach(function (v) {
-      var card = document.createElement('div');
-      card.className = 'card';
+      var tile = document.createElement('div');
+      tile.className = 'tile';
       var dur = fmtDuration(v.duration);
-      card.innerHTML =
-        '<div class="card-title">' + escapeHtml(v.title) + '</div>' +
-        '<div class="card-meta">' +
-          (dur ? dur + ' • ' : '') + (v.views || 0) + ' ভিউ' +
-        '</div>' +
-        '<button class="btn gold small">▶️ এড দেখে দেখুন</button>';
-      card.querySelector('button').addEventListener('click', function () {
-        openGate(v);
-      });
-      list.appendChild(card);
+      var poster = v.thumb
+        ? '<img class="poster-img" src="/api/thumb?video=' +
+          encodeURIComponent(v.id) + '" loading="lazy" alt="">'
+        : '<div class="poster-fallback">▶</div>';
+      tile.innerHTML =
+        '<div class="poster">' + poster + '</div>' +
+        (dur ? '<div class="tile-dur">' + dur + '</div>' : '') +
+        '<div class="tile-info">' +
+          '<div class="tile-title">' + escapeHtml(v.title) + '</div>' +
+          '<div class="tile-views">👁 ' + fmtViews(v.views) + '</div>' +
+        '</div>';
+      tile.addEventListener('click', function () { openGate(v); });
+      list.appendChild(tile);
     });
   }
 
