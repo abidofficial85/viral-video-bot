@@ -52,6 +52,7 @@ private WSGI file) is the only place it should live.
 
 import hashlib
 import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -108,6 +109,32 @@ def tg_urlopen(url_or_req, timeout):
                     {"http": TG_PROXY, "https": TG_PROXY}))
         return _TG_OPENER.open(url_or_req, timeout=timeout)
     return urllib.request.urlopen(url_or_req, timeout=timeout)
+
+
+def tg_urlopen_retry(url_or_req, timeout, attempts=3):
+    """urlopen with retries on connection-level failures.
+
+    PythonAnywhere's free proxy intermittently fails with
+    "Tunnel connection failed: 503" (seen 2026-10-28: a webhook reply
+    and a video stream both died this way). Retry ONLY when the request
+    provably did not complete (proxy tunnel failure, dropped
+    connection, timeout). HTTPError means Telegram
+    answered (e.g. 401 bad token, 400 bad request) — retrying that is
+    pointless, and for write calls it could duplicate a processed
+    request, so HTTPError is re-raised immediately.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return tg_urlopen(url_or_req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, http.client.HTTPException,
+                OSError) as e:
+            last = e
+            if i + 1 < attempts:
+                time.sleep(1 + i)
+    raise last
 
 TEST_MODE = not MONETAG_ZONE_ID  # no Monetag configured -> fake ad, full test flow
 VIDEOS_PATH = os.path.join(DATA_DIR, "videos.json")
@@ -179,7 +206,7 @@ def tg_api(method, payload=None, timeout=40):
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with tg_urlopen(req, timeout=timeout) as resp:
+        with tg_urlopen_retry(req, timeout=timeout) as resp:
             body = json.load(resp)
     except urllib.error.HTTPError as e:
         try:
@@ -229,7 +256,7 @@ def tg_send_document(chat_id, filename, content_bytes, caption=""):
     req = urllib.request.Request(
         url, data=b"".join(body),
         headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-    with tg_urlopen(req, timeout=60) as resp:
+    with tg_urlopen_retry(req, timeout=60) as resp:
         result = json.load(resp)
     if not result.get("ok"):
         raise RuntimeError("sendDocument failed: %s" % result.get("description"))
@@ -326,7 +353,7 @@ def handle_restore_document(message):
         info = tg_api("getFile", {"file_id": doc["file_id"]})
         path = info.get("file_path", "")
         url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN, path)
-        with tg_urlopen(url, timeout=60) as resp:
+        with tg_urlopen_retry(url, timeout=60) as resp:
             data = json.load(resp)
         videos = data.get("videos")
         if not isinstance(videos, list):
@@ -599,12 +626,18 @@ def do_postback(body_bytes):
 
 
 def open_stream(token, range_header):
-    """Eagerly open the upstream file; return (status, headers, chunks)."""
+    """Eagerly open the upstream file; return (status, headers, chunks).
+
+    The one-time token is consumed ONLY once the upstream opens
+    successfully: if getFile or the upstream fails (e.g. the flaky free
+    proxy), the same token still works for a retry instead of dying
+    with 403 on the second attempt (seen 2026-10-28: first stream
+    request 502, retry 4s later 403).
+    """
     entry = TOKENS.get(token)
     if not entry or entry.get("used") or time.time() > entry["expires"]:
         return json_error(403, "লিংকটির মেয়াদ শেষ বা ব্যবহার হয়ে "
                                "গেছে। আবার এড দেখুন।")
-    entry["used"] = True
     video = find_video(entry["video_id"])
     if not video:
         return json_error(404, "ভিডিওটি পাওয়া যায়নি।")
@@ -614,7 +647,32 @@ def open_stream(token, range_header):
                                     info.get("file_path", ""))
     except Exception as e:  # noqa: BLE001 - report cleanly
         return json_error(502, "ভিডিও আনতে সমস্যা: %s" % e)
-    # Count the view on first successful stream start.
+    headers = {}
+    if range_header:
+        headers["Range"] = range_header
+    req = urllib.request.Request(file_url, headers=headers)
+    upstream = None
+    last_error = None
+    for i in range(3):  # read-only GET: safe to retry on 5xx/URLError
+        try:
+            upstream = tg_urlopen(req, timeout=120)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and i + 1 < 3:
+                last_error = e
+                time.sleep(1 + i)
+                continue
+            return e.code, [("Content-Length", "0")], [b""]
+        except Exception as e:  # noqa: BLE001 - URLError etc.
+            last_error = e
+            if i + 1 < 3:
+                time.sleep(1 + i)
+                continue
+            break
+    if upstream is None:
+        return json_error(502, "ভিডিও স্ট্রিমে সমস্যা: %s" % last_error)
+    # Upstream is open: consume the token and count the view now.
+    entry["used"] = True
     try:
         with STORE_LOCK:
             videos = load_videos()
@@ -624,16 +682,6 @@ def open_stream(token, range_header):
             save_videos(videos)
     except OSError:
         pass
-    headers = {}
-    if range_header:
-        headers["Range"] = range_header
-    req = urllib.request.Request(file_url, headers=headers)
-    try:
-        upstream = tg_urlopen(req, timeout=120)
-    except urllib.error.HTTPError as e:
-        return e.code, [("Content-Length", "0")], [b""]
-    except Exception as e:  # noqa: BLE001
-        return json_error(502, "ভিডিও স্ট্রিমে সমস্যা: %s" % e)
     out_headers = []
     out_headers.append(("Content-Type",
                         upstream.headers.get("Content-Type") or "video/mp4"))
