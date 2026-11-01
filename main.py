@@ -13,6 +13,11 @@ What it does
     in the caption. Videos are stored as Telegram file_ids (not on disk),
     so they survive server restarts. Only the small videos.json index
     lives on disk — back it up with /export before redeploys.
+    Posters: the video's Telegram thumbnail is the grid poster by
+    default; the admin can change it two ways — tap "🖼️ ভিডিও থেকে
+    থাম্বনেইল বাছুন" to pick one of 4 ffmpeg frames from the video,
+    or send a photo (replying to the video, or captioned with its
+    title) to use that photo as the poster.
 * Mini App (this same process serves webapp/):
     User picks a video -> watches a Monetag Rewarded Interstitial ad
     (show_<ZONE_ID>() from the Monetag SDK tag) -> server verifies the
@@ -55,6 +60,9 @@ import hashlib
 import hmac
 import http.client
 import json
+import shutil
+import subprocess
+import tempfile
 import mimetypes
 import os
 import secrets
@@ -184,6 +192,9 @@ def public_video(v):
         "duration": v.get("duration", 0),
         "views": v.get("views", 0),
         "thumb": bool(v.get("thumb_file_id")),
+        # Bumped whenever the poster changes, so the Mini App's thumb
+        # URL changes too and a cached old poster is never reused.
+        "thumbVer": v.get("thumb_updated", 0),
     }
 
 
@@ -233,6 +244,40 @@ def tg_send_message(chat_id, text, reply_markup=None):
 def tg_answer_callback(callback_id, text=""):
     return tg_api("answerCallbackQuery",
                   {"callback_query_id": callback_id, "text": text})
+
+
+def tg_send_photo(chat_id, photo_bytes, caption="", reply_markup=None):
+    """Multipart photo upload (stdlib only). Returns the API result."""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    boundary = "----viralvideo" + secrets.token_hex(8)
+    body = []
+    body.append(("--%s\r\n" % boundary).encode())
+    body.append(('Content-Disposition: form-data; name="chat_id"\r\n\r\n').encode())
+    body.append(("%s\r\n" % chat_id).encode())
+    if caption:
+        body.append(("--%s\r\n" % boundary).encode())
+        body.append(('Content-Disposition: form-data; name="caption"\r\n\r\n').encode())
+        body.append((caption + "\r\n").encode())
+    if reply_markup:
+        body.append(("--%s\r\n" % boundary).encode())
+        body.append(('Content-Disposition: form-data; name="reply_markup"\r\n\r\n').encode())
+        body.append((json.dumps(reply_markup) + "\r\n").encode())
+    body.append(("--%s\r\n" % boundary).encode())
+    body.append(('Content-Disposition: form-data; name="photo"; '
+                 'filename="frame.jpg"\r\n').encode())
+    body.append(("Content-Type: image/jpeg\r\n\r\n").encode())
+    body.append(photo_bytes)
+    body.append(("\r\n--%s--\r\n" % boundary).encode())
+    url = "%s/bot%s/sendPhoto" % (API_BASE, BOT_TOKEN)
+    req = urllib.request.Request(
+        url, data=b"".join(body),
+        headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
+    with tg_urlopen_retry(req, timeout=60) as resp:
+        result = json.load(resp)
+    if not result.get("ok"):
+        raise RuntimeError("sendPhoto failed: %s" % result.get("description"))
+    return result.get("result")
 
 
 def tg_send_document(chat_id, filename, content_bytes, caption=""):
@@ -307,11 +352,13 @@ def handle_admin(chat_id):
              "💾 ব্যাকআপ নিতে: /export",
              "♻️ ব্যাকআপ ফেরাতে: videos.json ফাইলটি এখানে পাঠান।",
              "",
-             "ভিডিও ডিলিট করতে নিচের বাটন চাপুন:"]
+             "ভিডিও ডিলিট / থাম্বনেইল বদলাতে নিচের বাটন চাপুন:"]
     rows = []
     for v in videos:
         rows.append([{"text": "🗑 " + (v.get("title") or "Untitled"),
-                      "callback_data": "del:" + v["id"]}])
+                      "callback_data": "del:" + v["id"]},
+                     {"text": "🖼️",
+                      "callback_data": "frames:" + v["id"]}])
     markup = {"inline_keyboard": rows} if rows else None
     tg_send_message(chat_id, "\n".join(lines), markup)
 
@@ -333,20 +380,139 @@ def handle_video_upload(message):
     # Telegram attaches a thumbnail PhotoSize to videos ("thumbnail",
     # older clients "thumb") — keep it as the grid poster.
     thumb = video.get("thumbnail") or video.get("thumb") or {}
+    new_id = secrets.token_hex(6)
     with STORE_LOCK:
         videos = load_videos()
         videos.append({
-            "id": secrets.token_hex(6),
+            "id": new_id,
             "file_id": file_id,
             "thumb_file_id": thumb.get("file_id"),
+            "thumb_updated": int(time.time()) if thumb.get("file_id") else 0,
             "title": title,
             "duration": int(video.get("duration") or 0),
             "views": 0,
             "added_at": int(time.time()),
         })
         save_videos(videos)
-    tg_send_message(message["chat"]["id"],
-                    "✅ ভিডিও যোগ হয়েছে!\n🎬 %s" % title)
+    tg_send_message(
+        message["chat"]["id"],
+        "✅ ভিডিও যোগ হয়েছে!\n🎬 %s\n\n"
+        "🖼️ থাম্বনেইল বদলাতে নিচের বাটন চাপ দাও (ভিডিও থেকে ফ্রেম বাছবে), "
+        "অথবা নিজের ছবি পাঠাও — ভিডিও মেসেজে রিপ্লাই দিয়ে, "
+        "বা ছবির ক্যাপশনে এই টাইটেল লিখে।" % title,
+        {"inline_keyboard": [[{"text": "🖼️ ভিডিও থেকে থাম্বনেইল বাছুন",
+                               "callback_data": "frames:" + new_id}]]})
+
+
+def handle_photo_thumb(message):
+    """Admin sent a photo: use it as some video's poster.
+
+    Which video? In order: (1) the photo replies to the admin's own
+    video message (match by file_id); (2) it replies to the bot's
+    "video added" message (match the 🎬 title line); (3) its caption
+    is a video title. Otherwise explain how to target a video.
+    """
+    chat_id = message["chat"]["id"]
+    photos = message.get("photo") or []
+    if not photos:
+        return
+    best = max(photos, key=lambda p: int(p.get("file_size") or 0))
+    file_id = best.get("file_id")
+    video = None
+    reply = message.get("reply_to_message") or {}
+    if reply.get("video", {}).get("file_id"):
+        video = find_video_by_file_id(reply["video"]["file_id"])
+    if not video and reply.get("text"):
+        for line in reply["text"].splitlines():
+            if line.startswith("🎬 "):
+                video = find_video_by_title(line[2:].strip())
+                if video:
+                    break
+    if not video:
+        cap = (message.get("caption") or "").strip()
+        if cap:
+            video = find_video_by_title(cap)
+    if not video:
+        tg_send_message(
+            chat_id,
+            "❓ এই ছবিটা কোন ভিডিওর থাম্বনেইল হবে বুঝতে পারিনি।\n\n"
+            "ভিডিওর টাইটেল ক্যাপশনে লিখে আবার পাঠাও, অথবা "
+            "ভিডিও মেসেজে রিপ্লাই (swipe) দিয়ে ছবিটা পাঠাও।")
+        return
+    set_video_thumb(video["id"], file_id)
+    tg_send_message(chat_id,
+                    "✅ থাম্বনেইল বসেছে! 🎬 %s\n"
+                    "Mini App-এ এখন নতুন পোস্টার দেখাবে।"
+                    % (video.get("title") or ""))
+
+
+def handle_frames_callback(callback_id, chat_id, video_id):
+    """Admin tapped "pick a thumbnail from the video": download the
+    video, extract 4 frames with ffmpeg, send each with a ✅ button."""
+    v = find_video(video_id)
+    if not v:
+        tg_answer_callback(callback_id, "ভিডিওটি পাওয়া যায়নি।")
+        return
+    tg_answer_callback(callback_id, "ফ্রেম বানানো হচ্ছে...")
+    try:
+        with tempfile.TemporaryDirectory(prefix="vvdl") as tmpdir:
+            video_path = os.path.join(tmpdir, "video.mp4")
+            download_telegram_file(v["file_id"], video_path)
+            frames = extract_frames(video_path, int(v.get("duration") or 0))
+    except Exception as e:  # noqa: BLE001 - report to admin
+        tg_send_message(chat_id, "❌ ফ্রেম বানানো যায়নি: %s" % e)
+        return
+    if not frames:
+        tg_send_message(chat_id,
+                        "❌ এই ভিডিও থেকে ফ্রেম বানানো যায়নি। "
+                        "নিজের ছবি পাঠিয়ে থাম্বনেইল বসাও।")
+        return
+    pending = load_pending_thumbs()
+    entry = {}
+    for i, jpeg in enumerate(frames):
+        try:
+            result = tg_send_photo(
+                chat_id, jpeg, caption="ফ্রেম %d" % (i + 1),
+                reply_markup={"inline_keyboard": [[{
+                    "text": "✅ এইটা থাম্বনেইল",
+                    "callback_data": "thumb:%s:%d" % (video_id, i)}]]})
+            photos = result.get("photo") or []
+            if photos:
+                best = max(photos,
+                           key=lambda p: int(p.get("file_size") or 0))
+                entry[str(i)] = best.get("file_id")
+        except Exception as e:  # noqa: BLE001 - one frame failing is ok
+            log("frame send failed: %s" % e)
+    if entry:
+        pending[video_id] = entry
+        save_pending_thumbs(pending)
+        tg_send_message(chat_id,
+                        "উপরের ফ্রেমগুলো থেকে একটায় ✅ চাপ দাও — "
+                        "সেটাই থাম্বনেইল হবে।")
+    else:
+        tg_send_message(chat_id, "❌ ফ্রেম পাঠানো যায়নি, আবার চেষ্টা করো।")
+
+
+def handle_thumb_choice_callback(callback_id, chat_id, video_id, idx):
+    """Admin picked one of the extracted frames as the poster."""
+    v = find_video(video_id)
+    if not v:
+        tg_answer_callback(callback_id, "ভিডিওটি পাওয়া যায়নি।")
+        return
+    pending = load_pending_thumbs()
+    file_id = (pending.get(video_id) or {}).get(str(idx))
+    if not file_id:
+        tg_answer_callback(callback_id,
+                           "এই ফ্রেমটা আর পাওয়া যাচ্ছে না, আবার বাছো।")
+        return
+    set_video_thumb(video_id, file_id)
+    pending.pop(video_id, None)
+    save_pending_thumbs(pending)
+    tg_answer_callback(callback_id, "✅ থাম্বনেইল বসেছে!")
+    tg_send_message(chat_id,
+                    "✅ থাম্বনেইল বসেছে! 🎬 %s\n"
+                    "Mini App-এ এখন নতুন পোস্টার দেখাবে।"
+                    % (v.get("title") or ""))
 
 
 def handle_restore_document(message):
@@ -415,6 +581,12 @@ def handle_message(message):
         else:
             tg_send_message(chat_id, "ভিডিও আপলোড শুধু অ্যাডমিন করতে পারেন।")
         return
+    if "photo" in message:
+        if user_id == ADMIN_ID_INT:
+            handle_photo_thumb(message)
+        else:
+            tg_send_message(chat_id, "থাম্বনেইল বদল শুধু অ্যাডমিন করতে পারেন।")
+        return
     if "document" in message:
         if user_id == ADMIN_ID_INT:
             handle_restore_document(message)
@@ -444,6 +616,21 @@ def handle_update(update):
         user_id = cb.get("from", {}).get("id", 0)
         if data.startswith("watch:"):
             handle_watch_callback(cb["id"], chat_id, data[6:])
+        elif data.startswith("frames:"):
+            if user_id == ADMIN_ID_INT:
+                handle_frames_callback(cb["id"], chat_id, data[7:])
+            else:
+                tg_answer_callback(cb["id"], "শুধু অ্যাডমিন থাম্বনেইল বদলাতে পারেন।")
+        elif data.startswith("thumb:"):
+            if user_id == ADMIN_ID_INT:
+                parts = data.split(":")
+                if len(parts) == 3:
+                    handle_thumb_choice_callback(cb["id"], chat_id,
+                                                 parts[1], parts[2])
+                else:
+                    tg_answer_callback(cb["id"], "ভুল বাটন।")
+            else:
+                tg_answer_callback(cb["id"], "শুধু অ্যাডমিন থাম্বনেইল বদলাতে পারেন।")
         elif data.startswith("del:"):
             if user_id == ADMIN_ID_INT:
                 handle_delete_callback(cb["id"], chat_id, data[4:])
@@ -737,6 +924,96 @@ def do_setup_webhook():
         "ok": True,
         "webhook_url": WEBAPP_URL + webhook_path(),
     })
+
+
+# ---------------------------------------------------------------- Thumbnails
+
+PENDING_THUMBS_PATH = os.path.join(DATA_DIR, "pending_thumbs.json")
+
+
+def load_pending_thumbs():
+    try:
+        with open(PENDING_THUMBS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pending_thumbs(data):
+    with open(PENDING_THUMBS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def find_video_by_file_id(file_id):
+    for v in load_videos():
+        if v.get("file_id") == file_id:
+            return v
+    return None
+
+
+def find_video_by_title(title):
+    """Latest video whose title matches (case-insensitive, stripped)."""
+    want = (title or "").strip().casefold()
+    if not want:
+        return None
+    for v in reversed(load_videos()):
+        if (v.get("title") or "").strip().casefold() == want:
+            return v
+    return None
+
+
+def set_video_thumb(video_id, thumb_file_id):
+    """Set a video's poster; returns the video or None."""
+    with STORE_LOCK:
+        videos = load_videos()
+        for v in videos:
+            if v.get("id") == video_id:
+                v["thumb_file_id"] = thumb_file_id
+                v["thumb_updated"] = int(time.time())
+                save_videos(videos)
+                return v
+    return None
+
+
+def download_telegram_file(file_id, dest_path, timeout=180):
+    """Download a Telegram file to dest_path (streamed, with retries)."""
+    info = tg_api("getFile", {"file_id": file_id}, timeout=30)
+    url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN, info.get("file_path", ""))
+    with tg_urlopen_retry(url, timeout=timeout) as resp:
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
+def extract_frames(video_path, duration, count=4):
+    """Extract `count` JPEG frames with ffmpeg; returns [bytes, ...]."""
+    ffmpeg = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("সার্ভারে ffmpeg নেই")
+    if duration and duration > 0:
+        stamps = sorted({round(duration * frac, 2)
+                         for frac in (0.10, 0.35, 0.60, 0.85)})
+    else:
+        stamps = [0.5, 1.0, 2.0, 3.0]
+    frames = []
+    tmpdir = tempfile.mkdtemp(prefix="vvthumb")
+    try:
+        for i, t in enumerate(stamps[:count]):
+            out = os.path.join(tmpdir, "frame%d.jpg" % i)
+            proc = subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-ss", str(t),
+                 "-i", video_path, "-frames:v", "1", "-q:v", "4", out],
+                capture_output=True, timeout=120)
+            if proc.returncode == 0 and os.path.exists(out):
+                with open(out, "rb") as f:
+                    frames.append(f.read())
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return frames
 
 
 def open_thumb(video_id):
