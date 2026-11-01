@@ -172,7 +172,8 @@
       var dur = fmtDuration(v.duration);
       var poster = v.thumb
         ? '<img class="poster-img" src="/api/thumb?video=' +
-          encodeURIComponent(v.id) + '" loading="lazy" alt="">'
+          encodeURIComponent(v.id) + '&v=' + (v.thumbVer || 0) +
+          '" loading="lazy" alt="">'
         : '<div class="poster-fallback">▶</div>';
       tile.innerHTML =
         '<div class="poster">' + poster + '</div>' +
