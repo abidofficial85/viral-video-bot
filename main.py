@@ -171,7 +171,38 @@ def load_videos():
     return []
 
 
-def save_videos(videos):
+def _on_disk_videos():
+    """Videos list currently in videos.json, or None if unreadable."""
+    try:
+        with open(VIDEOS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("videos"), list):
+            return data["videos"]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def save_videos(videos, allow_empty=False):
+    # Guard (2026-11-04 data loss): a failed load returns [], and
+    # saving that would silently wipe the whole library. Refuse to
+    # overwrite a non-empty on-disk library with an empty list.
+    # Fresh starts (no file / empty file) may still write [].
+    # allow_empty is only for an explicit per-video delete that
+    # legitimately empties the library (deleting the last video).
+    current = _on_disk_videos()
+    if not videos and current and not allow_empty:
+        log("REFUSED empty save: videos.json holds %d videos"
+            % len(current))
+        return
+    # Backup: keep the previous library in videos.json.bak, so one
+    # bad write never destroys it. Single file, overwritten each save.
+    if current:
+        try:
+            with open(VIDEOS_PATH + ".bak", "w", encoding="utf-8") as f:
+                json.dump({"videos": current}, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
     tmp = VIDEOS_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"videos": videos}, f, ensure_ascii=False, indent=2)
@@ -530,6 +561,20 @@ def handle_restore_document(message):
         videos = data.get("videos")
         if not isinstance(videos, list):
             raise ValueError("bad backup format")
+        # Guards (2026-11-04 data loss): an empty backup must never
+        # wipe the library, and entries missing id/file_id could never
+        # stream (the stream path needs both). Refuse, keep the old list.
+        if not videos:
+            tg_send_message(message["chat"]["id"],
+                            "❌ ব্যাকআপে কোনো ভিডিও নেই — আগের লিস্টই আছে, "
+                            "খালি ব্যাকআপ বসানো হয়নি।")
+            return
+        if any(not isinstance(v, dict) or not v.get("id")
+               or not v.get("file_id") for v in videos):
+            tg_send_message(message["chat"]["id"],
+                            "❌ ব্যাকআপে ভাঙা এন্ট্রি আছে (id বা file_id নেই) — "
+                            "আগের লিস্টই আছে, ব্যাকআপ বসানো হয়নি।")
+            return
         with STORE_LOCK:
             save_videos(videos)
         tg_send_message(message["chat"]["id"],
@@ -566,7 +611,9 @@ def handle_delete_callback(callback_id, chat_id, video_id):
         if len(kept) == len(videos):
             tg_answer_callback(callback_id, "ভিডিওটি পাওয়া যায়নি।")
             return
-        save_videos(kept)
+        # Explicit delete: may legitimately empty the library
+        # (deleting the last video), so bypass the empty-save guard.
+        save_videos(kept, allow_empty=True)
     tg_answer_callback(callback_id, "ডিলিট হয়েছে।")
     tg_send_message(chat_id, "🗑 ভিডিও ডিলিট হয়েছে।")
 
