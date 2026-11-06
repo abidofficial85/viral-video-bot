@@ -409,6 +409,21 @@ def handle_video_upload(message):
     if not file_id:
         return
     title = (message.get("caption") or "").strip() or "Untitled"
+    # Telegram's Bot API getFile refuses files over 20 MB ("Bad Request:
+    # file is too big"), so such a video can never stream — refuse it
+    # here instead of letting it sit unplayable in the list. A missing
+    # file_size is never a reason to block an upload.
+    file_size = int(video.get("file_size") or 0)
+    if file_size > 20 * 1024 * 1024:
+        log("REFUSED oversized upload: %d bytes (title=%s)"
+            % (file_size, title))
+        tg_send_message(
+            message["chat"]["id"],
+            "❌ এই ভিডিওটা %.1f MB — ২০ MB-এর বেশি, তাই যোগ করা হয়নি।\n"
+            "Telegram-এর বট সিস্টেম ২০ MB-এর বেশি ফাইল চালাতে পারে না। "
+            "ভিডিওটা কমপ্রেস করে বা ২০ MB-এর নিচে ভাগ ভাগ করে আবার পাঠাও।"
+            % (file_size / 1048576.0))
+        return
     # Telegram attaches a thumbnail PhotoSize to videos ("thumbnail",
     # older clients "thumb") — keep it as the grid poster.
     thumb = video.get("thumbnail") or video.get("thumb") or {}
