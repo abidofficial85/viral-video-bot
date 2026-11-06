@@ -218,7 +218,7 @@
       showStreamError();
     };
     // Backstop for a load that hangs with no data at all (e.g. an
-    // upstream 502 that never surfaces as an error): 15s with zero
+    // upstream 502 that never surfaces as an error): 30s with zero
     // data and still at 0:00 counts as a failure. If data arrives
     // later, onplaying clears this UI again on its own.
     loadTimer = setTimeout(function () {
@@ -226,7 +226,7 @@
       if (!streamStarted && player.readyState < 2 && player.currentTime === 0) {
         showStreamError();
       }
-    }, 15000);
+    }, 30000);
     var p = player.play();
     if (p && p.catch) p.catch(function () {
       // A failed load rejects play() too, and the 'error' handler owns
