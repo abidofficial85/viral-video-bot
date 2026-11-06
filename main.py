@@ -241,7 +241,7 @@ def fmt_duration(seconds):
 
 # ---------------------------------------------------------------- Telegram API
 
-def tg_api(method, payload=None, timeout=40):
+def tg_api(method, payload=None, timeout=40, attempts=3):
     """Call the Bot API. Returns the `result` field or raises RuntimeError."""
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
@@ -250,7 +250,8 @@ def tg_api(method, payload=None, timeout=40):
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with tg_urlopen_retry(req, timeout=timeout) as resp:
+        with tg_urlopen_retry(req, timeout=timeout,
+                              attempts=attempts) as resp:
             body = json.load(resp)
     except urllib.error.HTTPError as e:
         try:
@@ -883,10 +884,15 @@ def open_stream(token, range_header):
     if not video:
         return json_error(404, "ভিডিওটি পাওয়া যায়নি।")
     try:
-        info = tg_api("getFile", {"file_id": video["file_id"]}, timeout=30)
+        # 5 attempts: the PA free proxy fails fast (503), and a short
+        # getFile is cheap to retry.
+        info = tg_api("getFile", {"file_id": video["file_id"]},
+                      timeout=30, attempts=5)
         file_url = "%s/bot%s/%s" % (FILE_BASE, BOT_TOKEN,
                                     info.get("file_path", ""))
     except Exception as e:  # noqa: BLE001 - report cleanly
+        log("stream getFile failed: video=%s error=%s" %
+            (video.get("id"), e))
         return json_error(502, "ভিডিও আনতে সমস্যা: %s" % e)
     headers = {}
     if range_header:
@@ -894,23 +900,31 @@ def open_stream(token, range_header):
     req = urllib.request.Request(file_url, headers=headers)
     upstream = None
     last_error = None
-    for i in range(3):  # read-only GET: safe to retry on 5xx/URLError
+    # 5 attempts, backoff 2/4/8/16s (30s total sleep): the PA free
+    # proxy fails fast with 503s, so extra quick retries ride out a
+    # blip without stalling a real download — the 120s read timeout
+    # stays, since a big file needs it once the transfer starts.
+    for i in range(5):  # read-only GET: safe to retry on 5xx/URLError
         try:
             upstream = tg_urlopen(req, timeout=120)
             break
         except urllib.error.HTTPError as e:
-            if e.code >= 500 and i + 1 < 3:
+            if e.code >= 500 and i + 1 < 5:
                 last_error = e
-                time.sleep(1 + i)
+                time.sleep(2 ** (i + 1))
                 continue
+            log("stream file-download failed: video=%s HTTP %s" %
+                (video.get("id"), e.code))
             return e.code, [("Content-Length", "0")], [b""]
         except Exception as e:  # noqa: BLE001 - URLError etc.
             last_error = e
-            if i + 1 < 3:
-                time.sleep(1 + i)
+            if i + 1 < 5:
+                time.sleep(2 ** (i + 1))
                 continue
             break
     if upstream is None:
+        log("stream file-download failed: video=%s error=%s" %
+            (video.get("id"), last_error))
         return json_error(502, "ভিডিও স্ট্রিমে সমস্যা: %s" % last_error)
     # Upstream is open: count the view once per token.
     if not entry.get("counted"):
